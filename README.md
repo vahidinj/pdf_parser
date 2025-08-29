@@ -1,5 +1,9 @@
 # PDF Bank Statement Parser Backend
 
+Still in DEVELOPMENT
+
+Use the main.py file to run a streamlit app for ease of use and convert bank statements (savings checking, credit cards imcoming) to csv files for easy data manipulations.
+
 FastAPI + parsing utilities to extract transactions from bank statement PDFs.
 
 ## Features
