@@ -29,29 +29,6 @@ backend/
   src/
     pdf_parser.py
     api.py
-```
-
-## Deploying (GitHub Repository)
-1. Initialize git (if not already):
-```
-cd backend
-git init
-```
-2. Add remote:
-```
-git remote add origin git@github.com:vahidinj/pdf_parser.git
-```
-(Or use https remote if preferred):
-```
-git remote add origin https://github.com/vahidinj/pdf_parser.git
-```
-3. Commit & push:
-```
-git add .
-git commit -m "Initial backend parser"
-git branch -M main
-git push -u origin main
-```
 
 ## Production Run
 Use a production ASGI server (e.g. uvicorn with workers or gunicorn + uvicorn workers):
