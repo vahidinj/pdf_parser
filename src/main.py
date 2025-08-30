@@ -69,20 +69,23 @@ def _filter_dataframe(df):
     if df.empty:
         return df
     f_df = df.copy()
-    # Account type filter
     if "account_type" in f_df.columns:
         types = sorted(f_df["account_type"].dropna().unique())
-        chosen = st.multiselect("Account types", types, default=types)
+        chosen = st.multiselect(
+            "Account types", types, default=types, key="filter_types"
+        )
         if chosen:
             f_df = f_df[f_df["account_type"].isin(chosen)]
-    # Description search
-    q = st.text_input("Description contains", placeholder="e.g. AMAZON")
+    q = st.text_input(
+        "Description contains", placeholder="e.g. AMAZON", key="filter_desc"
+    )
     if q:
         f_df = f_df[f_df["description"].str.contains(q, case=False, na=False)]
     return f_df
 
 
 def _debug_panels(df, unparsed, raw_lines):
+    """Render expandable debug information panels."""
     with st.expander("Unparsed candidate lines", expanded=False):
         if unparsed:
             st.code("\n".join(unparsed[:300]))
@@ -91,22 +94,22 @@ def _debug_panels(df, unparsed, raw_lines):
         else:
             st.write("None.")
     with st.expander("Balance mismatches", expanded=False):
-        if not df.empty:
+        if df is not None and not df.empty:
             mismatches = compute_balance_mismatches(df)
             if mismatches:
                 st.dataframe(mismatches, use_container_width=True)
             else:
                 st.write("None detected.")
     with st.expander("Sample raw lines", expanded=False):
-        st.code(
-            "\n".join(
-                f"{i + 1:04d}: {line_text}"
-                for i, (_, line_text) in enumerate(raw_lines[:400])
+        if raw_lines:
+            st.code(
+                "\n".join(
+                    f"{i + 1:04d}: {line_text}"
+                    for i, (_, line_text) in enumerate(raw_lines[:400])
+                )
             )
-        )
-
-
-# ----------------------------- Main App ----------------------------- #
+        else:
+            st.write("No raw lines captured.")
 
 
 def main():
@@ -119,83 +122,101 @@ def main():
     with st.sidebar:
         st.header("Upload & Options")
         uploaded = st.file_uploader(
-            "PDF statement", type=["pdf"], accept_multiple_files=False
+            "PDF statement", type=["pdf"], accept_multiple_files=False, key="uploader"
         )
-        parse_btn = st.button("Parse", type="primary", use_container_width=True)
-        show_debug = st.toggle(
-            "Show debug panels",
-            value=False,
-            help="Unparsed lines, balance diagnostics, raw sample",
+        parse_btn = st.button(
+            "Parse / Refresh", type="primary", use_container_width=True
         )
-        show_full_columns = st.checkbox("Show all columns", value=False)
+        show_debug = st.toggle("Show debug panels", value=False, key="debug_toggle")
+        show_full_columns = st.checkbox(
+            "Show all columns", value=False, key="full_cols"
+        )
 
     if not uploaded:
         st.info("Upload a PDF to begin.")
         return
 
-    if parse_btn:
-        file_bytes = uploaded.read()
-        hash_short = _file_hash(io.BytesIO(file_bytes))
+    ss = st.session_state
+    file_bytes = uploaded.getvalue()
+    file_hash = _file_hash(io.BytesIO(file_bytes))
+    need_parse = (
+        parse_btn
+        or ("_parsed_hash" not in ss)
+        or (ss.get("_parsed_hash") != file_hash)
+        or ("parsed_df" not in ss)
+    )
+
+    if need_parse:
         with st.spinner("Parsing PDF ..."):
             df, unparsed, raw_lines = _cached_parse(file_bytes)
-        if df.empty:
-            st.error("No transactions parsed from this document.")
-            if show_debug:
-                _debug_panels(df, unparsed, raw_lines)
-            return
-
-        st.success(
-            f"Parsed {len(df)} transactions across {df['account_number'].nunique() if 'account_number' in df.columns else '?'} account(s). Cache key {hash_short}."
+        ss.update(
+            {
+                "parsed_df": df,
+                "unparsed_lines": unparsed,
+                "raw_lines": raw_lines,
+                "_parsed_hash": file_hash,
+            }
         )
-        _render_metrics(df)
-
-        st.subheader("Transactions")
-        filtered_df = _filter_dataframe(df)
-        base_cols = [
-            "date",
-            "post_date" if "post_date" in df.columns else None,
-            "account_type" if "account_type" in df.columns else None,
-            "account_name" if "account_name" in df.columns else None,
-            "account_number" if "account_number" in df.columns else None,
-            "description",
-            "amount",
-            "debit" if "debit" in df.columns else None,
-            "credit" if "credit" in df.columns else None,
-            "balance" if "balance" in df.columns else None,
-        ]
-        core_cols = [c for c in base_cols if c]
-        display_cols = (
-            core_cols
-            if show_full_columns
-            else [c for c in core_cols if c not in {"debit", "credit"}]
-        )
-        st.dataframe(
-            filtered_df[display_cols], use_container_width=True, hide_index=True
-        )
-
-        col_dl1, col_dl2 = st.columns(2)
-        with col_dl1:
-            st.download_button(
-                "Download (filtered CSV)",
-                data=filtered_df[display_cols].to_csv(index=False).encode("utf-8"),
-                file_name="statement_filtered.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with col_dl2:
-            st.download_button(
-                "Download (full CSV)",
-                data=df[core_cols].to_csv(index=False).encode("utf-8"),
-                file_name="statement_full.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-        if show_debug:
-            st.divider()
-            _debug_panels(df, unparsed, raw_lines)
     else:
-        st.info("Click Parse to process the uploaded file.")
+        df = ss["parsed_df"]
+        unparsed = ss.get("unparsed_lines", [])
+        raw_lines = ss.get("raw_lines", [])
+
+    if df is None or df.empty:
+        st.error("No transactions parsed from this document.")
+        if show_debug:
+            _debug_panels(df, unparsed, raw_lines)
+        return
+
+    st.success(
+        f"Parsed {len(df)} transactions across {df['account_number'].nunique() if 'account_number' in df.columns else '?'} account(s). Hash {file_hash}."
+    )
+    _render_metrics(df)
+
+    st.subheader("Transactions")
+    filtered_df = _filter_dataframe(df)
+    base_cols = [
+        "date",
+        "post_date" if "post_date" in df.columns else None,
+        "account_type" if "account_type" in df.columns else None,
+        "account_name" if "account_name" in df.columns else None,
+        "account_number" if "account_number" in df.columns else None,
+        "description",
+        "amount",
+        "debit" if "debit" in df.columns else None,
+        "credit" if "credit" in df.columns else None,
+        "balance" if "balance" in df.columns else None,
+    ]
+    core_cols = [c for c in base_cols if c]
+    show_full_columns = st.session_state.get("full_cols", False)
+    display_cols = (
+        core_cols
+        if show_full_columns
+        else [c for c in core_cols if c not in {"debit", "credit"}]
+    )
+    st.dataframe(filtered_df[display_cols], use_container_width=True, hide_index=True)
+
+    col_dl1, col_dl2 = st.columns(2)
+    with col_dl1:
+        st.download_button(
+            "Download (filtered CSV)",
+            data=filtered_df[display_cols].to_csv(index=False).encode("utf-8"),
+            file_name="statement_filtered.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with col_dl2:
+        st.download_button(
+            "Download (full CSV)",
+            data=df[core_cols].to_csv(index=False).encode("utf-8"),
+            file_name="statement_full.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    if show_debug:
+        st.divider()
+        _debug_panels(df, unparsed, raw_lines)
 
 
 if __name__ == "__main__":
