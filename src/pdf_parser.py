@@ -98,22 +98,20 @@ SKIP_CONTAINS = ["Average Daily Balance", "Beginning Balnce", "Ending Balance"]
 
 
 def classify_account(name: str | None) -> str | None:
-    """Classify an account name into a broad type.
+    """Classify an account name into ONLY 'checking' or 'savings'.
 
-    Returns one of:
+    All variants (money market, share, mmsa, mm, etc.) are normalized to
+    one of two buckets required by the downstream app:
       - "checking"
-      - "savings" (includes generic savings, share accounts)
-      - "money_market_savings" (money market / MM / MMSA variants)
-      - None if no classification.
+      - "savings"
 
-    Heuristics are credit-union friendly ("Share Draft" = checking, "Share" alone = savings).
+    If heuristics fail to identify a checking keyword, the fallback is "savings".
     """
     if not name:
         return None
     n = name.lower()
     n_norm = re.sub(r"[^a-z0-9 ]+", " ", n)
-    if "money market" in n_norm or re.search(r"\bmm(sa)?\b", n_norm):
-        return "money_market_savings"
+    # Identify checking style names first
     if (
         "checking" in n_norm
         or re.search(r"\bchk\b", n_norm)
@@ -121,13 +119,102 @@ def classify_account(name: str | None) -> str | None:
         or re.search(r"\bdraft\b", n_norm)
     ):
         return "checking"
+    # Everything else that looks like savings / money market -> savings
     if (
         "savings" in n_norm
         or "saving" in n_norm
+        or "money market" in n_norm
+        or re.search(r"\bmm(sa)?\b", n_norm)
         or ("share" in n_norm and "draft" not in n_norm)
     ):
         return "savings"
-    return None
+    # Fallback bucket -> savings (so we only ever have two categories)
+    return "savings"
+
+
+# ---- Credit card specific helpers ----
+CREDIT_CARD_DETECT_PATTERNS = [
+    re.compile(r"Minimum Payment Due", re.IGNORECASE),
+    re.compile(r"Credit Limit", re.IGNORECASE),
+    re.compile(r"Statement Closing Date", re.IGNORECASE),
+]
+
+CC_TXN_LINE_RX = re.compile(
+    r"^(?P<trans_date>\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\s+"  # transaction date
+    r"(?P<post_date>\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\s+"  # post date
+    r"(?P<ref>\d{8,})\s+"  # long reference number
+    r"(?P<rest>.+?)\s+\$?(?P<amount>[0-9,]+(?:\.\d{2})?)$"  # description + amount
+)
+
+CC_SECTION_HEADER_RX = re.compile(
+    r"^(TRANSACTIONS|PAYMENTS AND CREDITS|TOTAL .*|Rewards Details|REWARD POINT SUMMARY)$",
+    re.IGNORECASE,
+)
+
+CC_PAYMENT_KEYWORDS = ["PAYMENT RECEIVED"]
+CC_CREDIT_KEYWORDS = ["CREDIT", "REFUND"]
+
+
+def detect_credit_card(lines: list[str]) -> bool:
+    score = 0
+    for ln in lines[:120]:  # first few pages typically hold summary box
+        for rx in CREDIT_CARD_DETECT_PATTERNS:
+            if rx.search(ln):
+                score += 1
+                if score >= 2:
+                    return True
+    return False
+
+
+def parse_line_credit(
+    line: str,
+    default_year: int | None,
+    account_name: str | None,
+    account_number: str | None,
+    account_type: str | None,
+):
+    """Parse a credit-card style transaction line with two dates and a reference.
+
+    Returns a dict compatible with the bank statement parser or None.
+    Amount polarity: purchases -> positive (outflow / increase liability), payments & credits -> negative.
+    """
+    m = CC_TXN_LINE_RX.match(line)
+    if not m:
+        return None
+    tdate_raw = m.group("trans_date")
+    pdate_raw = m.group("post_date")
+    ref = m.group("ref")
+    rest = m.group("rest").strip()
+    amount_raw = m.group("amount")
+    amount = normalize_number(amount_raw)
+    if amount is None:
+        return None
+    desc = f"{rest}".strip()
+    desc_up = desc.upper()
+    # Determine sign: purchases/fees -> negative (outflow / increase liability), payments & credits -> positive
+    if any(k in desc_up for k in CC_PAYMENT_KEYWORDS) or any(
+        k in desc_up for k in CC_CREDIT_KEYWORDS
+    ):
+        signed_amount = abs(amount)  # reduces liability
+    else:
+        signed_amount = -abs(amount)  # spending / charges
+    # Date parsing (prefer transaction date as primary)
+    d_primary = parse_date(tdate_raw, default_year, None)
+    return {
+        "date": d_primary,
+        "date_raw": tdate_raw,
+        "post_date": parse_date(pdate_raw, default_year, None),
+        "description": f"{desc} REF:{ref}",
+        "amount": signed_amount,
+        "debit": abs(signed_amount) if signed_amount < 0 else None,
+        "credit": signed_amount if signed_amount > 0 else None,
+        "balance": None,  # typical CC lines do not show running balance here
+        "account_name": account_name,
+        "account_number": account_number,
+        "account_type": account_type or "credit_card",
+        "line_type": "transaction",
+        "raw_line": line,
+    }
 
 
 def infer_year(all_lines: list[str]) -> int | None:
@@ -170,41 +257,31 @@ def normalize_number(raw: str | None) -> float | None:
         return None
     token = raw.strip()
     neg = False
-    # Trailing minus form: 123.45-
     if token.endswith("-") and token.count("-") == 1:
         neg = True
         token = token[:-1]
-    # Parentheses form: (123.45)
     if token.startswith("(") and token.endswith(")"):
         neg = True
         token = token[1:-1]
-    # Remove currency symbol and grouping
     token_nosym = token.replace("$", "").replace(",", "")
-    # Leading sign
     if token_nosym.startswith("-"):
         neg = True
         token_nosym = token_nosym[1:]
     core = token_nosym
-    # Basic numeric pattern
     if not re.fullmatch(r"\d+(?:\.\d+)?", core):
         return None
-    # Reject overly long integer without decimal (likely an ID)
     if "." not in core and len(core) > 7:
         return None
-    # If decimal, must have exactly two places for currency
     if "." in core:
         int_part, frac_part = core.split(".", 1)
-        if not (
-            1 <= len(frac_part) <= 2
-        ):  # allow 1 or 2 (some statements omit trailing 0)
+        if not (1 <= len(frac_part) <= 2):
             return None
-        if len(frac_part) == 1:  # normalize one decimal place by padding
+        if len(frac_part) == 1:
             core = int_part + "." + frac_part + "0"
     try:
         v = float(core)
     except ValueError:
         return None
-    # Absurd cutoff (1 billion) — treat as non-amount
     if v > 1_000_000_000:
         return None
     return -v if neg else v
@@ -335,7 +412,6 @@ def extract_raw_lines(
             prev_pg, prev_text = merged[-1]
             prev_starts_with_date = bool(date_prefix.match(prev_text))
             curr_starts_with_date = bool(date_prefix.match(text))
-            # Detect account headers inline; don't merge across them
             prev_has_header = bool(ACCOUNT_HEADER_INLINE_RX.search(prev_text))
             curr_has_header = bool(ACCOUNT_HEADER_INLINE_RX.search(text))
             if (
@@ -387,17 +463,33 @@ def parse_line(
     description = " ".join(tokens).strip()
     if not description:
         return None
-    # Skip balance marker lines entirely per user request
+    # Handle explicit beginning / ending balance marker lines so they are not flagged unparsed
     if description in {"Beginning Balance", "Ending Balance"}:
-        return None
+        bal_val = None
+        if len(trailing) == 1:
+            bal_val = normalize_number(trailing[0])
+        elif len(trailing) >= 2:  # sometimes an extra reference then amount
+            # try last token
+            bal_val = normalize_number(trailing[-1])
+        return {
+            "date": parse_date(date_raw, default_year, date_order),
+            "date_raw": date_raw,
+            "description": description,
+            "amount": None,
+            "debit": None,
+            "credit": None,
+            "balance": bal_val,
+            "account_name": account_name,
+            "account_number": account_number,
+            "account_type": account_type,
+            "line_type": "marker",
+            "raw_line": line,
+        }
 
     amount = balance = None
     debit = credit = None
 
     if len(trailing) == 3:
-        # Heuristic: if first token looks like a reference/check number (no decimal, length>=5)
-        # and the next two tokens look like monetary values (have decimal OR parentheses OR trailing minus),
-        # treat the first token as part of the description instead of an amount.
         ref_candidate = trailing[0]
         monetary_tail = trailing[1:]
 
@@ -410,11 +502,9 @@ def parse_line(
             and "." not in ref_candidate
             and any(_looks_money(t) for t in monetary_tail)
         ):
-            # push reference back into description tokens
             description = (description + " " + ref_candidate).strip()
             trailing = trailing[1:]
-
-    if len(trailing) == 3:  # Re-evaluate if still 3 after potential adjustment
+    if len(trailing) == 3:
         a1 = normalize_number(trailing[0])
         a2 = normalize_number(trailing[1])
         b = normalize_number(trailing[2])
@@ -431,18 +521,12 @@ def parse_line(
             amount = a1
             balance = b
     elif len(trailing) == 2:
-        # Possible patterns:
-        #  (ref, amount)  e.g., 2100002 120.47-
-        #  (amount, balance) normal
-        #  (amount, ?) ambiguous
         t0, t1 = trailing
         looks_ref = t0.isdigit() and len(t0) >= 5 and "." not in t0
         looks_money = bool(re.search(r"[().-]", t1) or "." in t1)
-        # If first looks like a reference and second like money, push reference into description
         if looks_ref and looks_money:
             description = (description + " " + t0).strip()
             trailing = [t1]
-            # Re-handle as single token
             a1 = normalize_number(trailing[0])
             if a1 is not None and not (trailing[0].isdigit() and len(trailing[0]) > 8):
                 amount = a1
@@ -502,6 +586,7 @@ def parse_bank_statement(
     rows = []
     unparsed: list[str] = []
     account_name = account_number = account_type = None
+    credit_card_mode = detect_credit_card([line_text for _, line_text in raw_lines])
 
     for pg, line in raw_lines:
         hdr = ACCOUNT_HEADER_RX.match(line)
@@ -511,7 +596,30 @@ def parse_bank_statement(
             account_name = hdr.group("name").strip()
             account_number = hdr.group("number")
             account_type = classify_account(account_name)
-        rec = parse_line(line, default_year, account_name, account_number, account_type)
+        # Skip pure date range lines (statement period headers) so they don't clutter unparsed
+        if DATE_RANGE_RX.match(line):
+            continue
+        if credit_card_mode:
+            rec = parse_line_credit(
+                line,
+                default_year,
+                account_name,
+                account_number,
+                account_type or "credit_card",
+            )
+            if not rec:
+                # fall back to bank line parse in case of marker lines we already support
+                rec = parse_line(
+                    line,
+                    default_year,
+                    account_name,
+                    account_number,
+                    account_type,
+                )
+        else:
+            rec = parse_line(
+                line, default_year, account_name, account_number, account_type
+            )
         if rec:
             rows.append(rec)
         else:
@@ -539,6 +647,41 @@ def parse_bank_statement(
             )
             if mask_all_none.any():
                 df = df[~mask_all_none]
+            # Normalize account types: if credit_card present keep it; else collapse to checking/savings
+            if "account_type" in df.columns:
+                if (df["account_type"] == "credit_card").any():
+                    df.loc[df["account_type"].isna(), "account_type"] = "credit_card"
+                else:
+                    df["account_type"] = (
+                        df["account_type"]
+                        .fillna("savings")
+                        .apply(lambda v: "checking" if v == "checking" else "savings")
+                    )
+            # For credit card mode, attempt synthetic running balance if summary 'Previous Balance' & 'New Balance' found
+            if credit_card_mode and "amount" in df.columns:
+                # Try to derive previous & new balance from lines captured as markers
+                prev_bal = None
+                new_bal = None
+                # search raw lines for Previous Balance / New Balance amounts
+                for _, ln in raw_lines:
+                    m_prev = re.search(
+                        r"Previous Balance \$([0-9,]+(?:\.\d{2})?)", ln, re.IGNORECASE
+                    )
+                    if m_prev:
+                        prev_bal = normalize_number(m_prev.group(1))
+                    m_new = re.search(
+                        r"New Balance \$([0-9,]+(?:\.\d{2})?)", ln, re.IGNORECASE
+                    )
+                    if m_new:
+                        new_bal = normalize_number(m_new.group(1))
+                if prev_bal is not None:
+                    # Compute cumulative balance = prev_bal + cumsum(amount)
+                    df = df.sort_values(
+                        [c for c in ["account_number", "date_raw"] if c in df.columns]
+                    )
+                    running = prev_bal + df["amount"].cumsum()
+                    if new_bal is None or abs(running.iloc[-1] - new_bal) < 0.05:
+                        df["balance"] = running
         except Exception:
             pass
     return df, unparsed, raw_lines
